@@ -1,0 +1,292 @@
+# =============================================================================
+# Pipeline : Export JSON Control-M -> 3 fichiers Excel
+# =============================================================================
+#
+# OBJECTIF
+# --------
+# Cette pipeline permet de choisir la provenance du JSON Control-M puis lance
+# le script Python ctm_json_to_excel.py.
+#
+# Pour chaque JSON sélectionné, le script produit :
+#   - <nom>_hierarchie.xlsx
+#   - <nom>_ligne.xlsx
+#   - <nom>_synthese.xlsx
+#
+# La pipeline est volontairement MANUELLE afin que l'utilisateur choisisse la
+# source et le fichier au moment de faire "Run pipeline" dans Azure DevOps.
+#
+# -----------------------------------------------------------------------------
+# SOURCE JSON CONTROL-M
+# -----------------------------------------------------------------------------
+# BUILD
+#   DEV BUILD   -> build/dev
+#   PPRD BUILD  -> build/pep
+#   QAL BUILD   -> build/qaf
+#   PROD BUILD  -> build/prd
+#
+# Les JSON BUILD sont principalement destinés aux besoins liés aux tickets
+# Jira CLM. Il s'agit généralement d'exports correspondant au périmètre d'une
+# évolution, souvent nommés CLM-XXX.json.
+#
+# SMARTFOLDER
+#   DEV SMARTFOLDER   -> src/smartfolder/dev
+#   PPRD SMARTFOLDER  -> src/smartfolder/pep
+#   QAL SMARTFOLDER   -> src/smartfolder/qaf
+#   PROD SMARTFOLDER  -> src/smartfolder/prd
+#
+# Les JSON SMARTFOLDER correspondent aux SmartFolders extraits automatiquement
+# depuis Control-M et régulièrement remis à jour.
+#
+# -----------------------------------------------------------------------------
+# PARAMETRE "Fichier(s) JSON à analyser"
+# -----------------------------------------------------------------------------
+# Le paramètre jsonFile accepte :
+#   - un nom exact : CLM-200-PRD.json
+#   - un masque     : CLM-*.json
+#   - tous les JSON : *.json
+#
+# La recherche est volontairement limitée au répertoire choisi par le paramètre
+# "Source JSON Control-M".
+#
+# -----------------------------------------------------------------------------
+# EMPLACEMENT DU SCRIPT PYTHON
+# -----------------------------------------------------------------------------
+# Par défaut, la variable pythonScript suppose que le script est situé à la
+# racine du repository :
+#
+#   ctm_json_to_excel.py
+#
+# S'il est rangé ailleurs, par exemple scripts/controlm/, modifier simplement :
+#
+#   pythonScript: 'scripts/controlm/ctm_json_to_excel.py'
+# =============================================================================
+
+# Exécution manuelle uniquement : les paramètres seront choisis dans l'interface.
+trigger: none
+pr: none
+
+# -----------------------------------------------------------------------------
+# Paramètres visibles dans l'écran "Run pipeline"
+# -----------------------------------------------------------------------------
+parameters:
+- name: sourceJsonControlM
+  displayName: 'Source JSON Control-M'
+  type: string
+  default: 'DEV BUILD'
+  values:
+  - 'DEV BUILD'
+  - 'PPRD BUILD'
+  - 'QAL BUILD'
+  - 'PROD BUILD'
+  - 'DEV SMARTFOLDER'
+  - 'PPRD SMARTFOLDER'
+  - 'QAL SMARTFOLDER'
+  - 'PROD SMARTFOLDER'
+
+- name: jsonFile
+  displayName: 'Fichier(s) JSON à analyser'
+  type: string
+  # Valeur pratique par défaut : traite tous les JSON du répertoire choisi.
+  # Pour une CLM précise, saisir par exemple : CLM-200-PRD.json
+  default: '*.json'
+
+# -----------------------------------------------------------------------------
+# Agent
+# -----------------------------------------------------------------------------
+# Le script est multiplateforme. ubuntu-latest est utilisé ici car Python y est
+# simple à préparer. Si votre organisation impose un pool self-hosted, remplacer
+# ce bloc par votre pool habituel.
+pool:
+  vmImage: 'ubuntu-latest'
+
+# -----------------------------------------------------------------------------
+# Variables communes
+# -----------------------------------------------------------------------------
+variables:
+  # Chemin relatif au repository du script Python.
+  pythonScript: 'cipipeline/ctm_to_excel/ctm_json_to_excel.py'
+
+  # Tous les Excel seront écrits ici avant publication en artefact Azure DevOps.
+  excelOutputDirectory: '$(Build.ArtifactStagingDirectory)/controlm-excel'
+
+  # ---------------------------------------------------------------------------
+  # Mapping du paramètre "Source JSON Control-M" vers le répertoire du repo.
+  # Les expressions ${{ if ... }} sont évaluées AVANT l'exécution du job.
+  # ---------------------------------------------------------------------------
+  ${{ if eq(parameters.sourceJsonControlM, 'DEV BUILD') }}:
+    sourceDirectory: 'build/dev'
+
+  ${{ if eq(parameters.sourceJsonControlM, 'PPRD BUILD') }}:
+    sourceDirectory: 'build/pep'
+
+  ${{ if eq(parameters.sourceJsonControlM, 'QAL BUILD') }}:
+    sourceDirectory: 'build/qaf'
+
+  ${{ if eq(parameters.sourceJsonControlM, 'PROD BUILD') }}:
+    sourceDirectory: 'build/prd'
+
+  ${{ if eq(parameters.sourceJsonControlM, 'DEV SMARTFOLDER') }}:
+    sourceDirectory: 'src/smartfolder/dev'
+
+  ${{ if eq(parameters.sourceJsonControlM, 'PPRD SMARTFOLDER') }}:
+    sourceDirectory: 'src/smartfolder/pep'
+
+  ${{ if eq(parameters.sourceJsonControlM, 'QAL SMARTFOLDER') }}:
+    sourceDirectory: 'src/smartfolder/qaf'
+
+  ${{ if eq(parameters.sourceJsonControlM, 'PROD SMARTFOLDER') }}:
+    sourceDirectory: 'src/smartfolder/prd'
+
+steps:
+# =============================================================================
+# ETAPE 0 - Protection de branche
+# =============================================================================
+# Le pipeline est volontairement autorisé UNIQUEMENT depuis la branche
+# integration. Même si un utilisateur sélectionne manuellement main dans
+# l'écran "Run pipeline", l'exécution s'arrête ici avant le checkout du repo.
+#
+# Remarque : Azure DevOps crée quand même un run pour effectuer ce contrôle,
+# mais aucune étape métier (checkout, lecture JSON, Python, génération Excel)
+# n'est exécutée sur une autre branche.
+- bash: |
+    set -euo pipefail
+
+    echo "Branche demandée : $(Build.SourceBranch)"
+
+    if [[ "$(Build.SourceBranch)" != "refs/heads/integration" ]]; then
+      echo "##vso[task.logissue type=error]Cette pipeline ne peut être exécutée que depuis la branche integration."
+      echo "Branche actuelle : $(Build.SourceBranch)"
+      exit 1
+    fi
+
+    echo "OK : branche integration autorisée."
+  displayName: 'Vérifier la branche integration'
+
+# =============================================================================
+# ETAPE 1 - Récupérer le repository
+# =============================================================================
+# Cette étape n'est atteinte que si le contrôle précédent a réussi.
+- checkout: self
+  clean: true
+  displayName: 'Checkout du repository'
+
+# =============================================================================
+# ETAPE 2 - Préparer Python
+# =============================================================================
+# On fixe une version de Python afin d'éviter qu'une évolution de l'agent change
+# le comportement de la pipeline.
+- task: UsePythonVersion@0
+  displayName: 'Préparer Python 3.11'
+  inputs:
+    versionSpec: '3.11'
+    addToPath: true
+
+# =============================================================================
+# ETAPE 3 - Installer la dépendance du script
+# =============================================================================
+# openpyxl est la seule bibliothèque Python externe nécessaire à la création des
+# classeurs XLSX.
+- bash: |
+    set -euo pipefail
+    python -m pip install --upgrade pip
+    python -m pip install openpyxl
+  displayName: 'Installer openpyxl'
+
+# =============================================================================
+# ETAPE 4 - Afficher la sélection et contrôler les chemins
+# =============================================================================
+- bash: |
+    set -euo pipefail
+
+    SOURCE_DIR="$(Build.SourcesDirectory)/$(sourceDirectory)"
+    SCRIPT="$(Build.SourcesDirectory)/$(pythonScript)"
+    JSON_PATTERN='${{ parameters.jsonFile }}'
+
+    echo "============================================================"
+    echo "Source JSON Control-M : ${{ parameters.sourceJsonControlM }}"
+    echo "Répertoire source     : $SOURCE_DIR"
+    echo "Sélection JSON        : $JSON_PATTERN"
+    echo "Script Python         : $SCRIPT"
+    echo "============================================================"
+
+    if [ ! -d "$SOURCE_DIR" ]; then
+      echo "##vso[task.logissue type=error]Répertoire source introuvable : $SOURCE_DIR"
+      exit 1
+    fi
+
+    if [ ! -f "$SCRIPT" ]; then
+      echo "##vso[task.logissue type=error]Script Python introuvable : $SCRIPT"
+      echo "Vérifier la variable 'pythonScript' dans le YAML."
+      exit 1
+    fi
+
+    # Le paramètre doit rester un nom ou un masque de fichier et ne doit pas
+    # permettre de sortir du répertoire source sélectionné.
+    if [[ "$JSON_PATTERN" == *".."* || "$JSON_PATTERN" == /* ]]; then
+      echo "##vso[task.logissue type=error]Le paramètre jsonFile ne doit pas contenir '..' ni être un chemin absolu."
+      exit 1
+    fi
+  displayName: 'Contrôler les paramètres'
+
+# =============================================================================
+# ETAPE 5 - Générer les trois Excel pour chaque JSON correspondant
+# =============================================================================
+- bash: |
+    set -euo pipefail
+
+    SOURCE_DIR="$(Build.SourcesDirectory)/$(sourceDirectory)"
+    SCRIPT="$(Build.SourcesDirectory)/$(pythonScript)"
+    OUTPUT_DIR="$(excelOutputDirectory)"
+    JSON_PATTERN='${{ parameters.jsonFile }}'
+
+    mkdir -p "$OUTPUT_DIR"
+
+    # On collecte les fichiers avec find afin que le masque *.json ou CLM-*.json
+    # soit interprété dans le seul répertoire source sélectionné.
+    JSON_FILES=()
+    while IFS= read -r -d '' JSON_FILE; do
+      JSON_FILES+=("$JSON_FILE")
+    done < <(find "$SOURCE_DIR" -maxdepth 1 -type f -name "$JSON_PATTERN" -print0 | sort -z)
+
+    if [ "${#JSON_FILES[@]}" -eq 0 ]; then
+      echo "##vso[task.logissue type=error]Aucun JSON correspondant à '$JSON_PATTERN' dans '$SOURCE_DIR'."
+      echo "JSON disponibles dans ce répertoire :"
+      find "$SOURCE_DIR" -maxdepth 1 -type f -name '*.json' -printf '  - %f\n' | sort || true
+      exit 1
+    fi
+
+    echo "${#JSON_FILES[@]} fichier(s) JSON à traiter."
+
+    for JSON_FILE in "${JSON_FILES[@]}"; do
+      FILE_NAME="$(basename "$JSON_FILE")"
+      STEM="${FILE_NAME%.json}"
+
+      echo
+      echo "------------------------------------------------------------"
+      echo "Traitement : $FILE_NAME"
+      echo "------------------------------------------------------------"
+
+      python "$SCRIPT" "$JSON_FILE" \
+        --output "$OUTPUT_DIR/${STEM}_hierarchie.xlsx" \
+        --flat-output "$OUTPUT_DIR/${STEM}_ligne.xlsx" \
+        --summary-output "$OUTPUT_DIR/${STEM}_synthese.xlsx"
+    done
+
+    echo
+    echo "============================================================"
+    echo "Fichiers Excel générés :"
+    find "$OUTPUT_DIR" -maxdepth 1 -type f -name '*.xlsx' -printf '  - %f\n' | sort
+    echo "============================================================"
+  displayName: 'Générer les Excel Control-M'
+
+# =============================================================================
+# ETAPE 6 - Publier les fichiers comme artefact Azure DevOps
+# =============================================================================
+# PublishBuildArtifacts@1 fonctionne avec Azure Pipelines / Azure DevOps Server.
+# Dans Azure DevOps Services, PublishPipelineArtifact@1 peut aussi être utilisé.
+- task: PublishBuildArtifacts@1
+  displayName: 'Publier les Excel en artefact'
+  inputs:
+    PathtoPublish: '$(excelOutputDirectory)'
+    ArtifactName: 'ControlM_Excel'
+    publishLocation: 'Container'
