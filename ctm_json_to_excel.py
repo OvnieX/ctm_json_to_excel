@@ -1,154 +1,39 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-===============================================================================
- Control-M JSON -> Excel (.xlsx)
-===============================================================================
+"""Convertit un JSON Control-M en trois classeurs Excel et deux bilans.
 
-BUT DU SCRIPT
--------------
-Ce programme transforme un export JSON Control-M en trois vues Excel différentes.
-Les trois fichiers sont construits à partir du MEME modèle interne : le JSON n'est
-parcouru qu'une seule fois, puis les objets détectés (Folder, SubFolder et Job)
-sont réutilisés pour fabriquer les trois classeurs.
+Usage : python ctm_json_to_excel.py export.json
+Dépendance externe : openpyxl. Options et formats détaillés dans README.md.
 
-FORMATS CONTROL-M PRIS EN CHARGE
---------------------------------
-Les exports Control-M rencontrés dans le dépôt n'ont pas toujours la même forme.
-Le parseur gère donc deux familles de structures :
+Les objets nommés par clés JSON et les listes Jobs alimentent le même modèle
+Folder/SubFolder/Job. La hiérarchie vient du JSON ; les occurrences sont gardées.
+Les vues produites sont hiérarchique, à plat et synthétique.
 
-1) FORMAT PAR CLES JSON
+La synthèse conserve Commande / Script après Type, Host, Run As et les contrôles
+non bloquants de définition. La criticité provient uniquement de SEVERITE.
+Les paramètres cycliques sont détaillés et aucun planning hérité n'est calculé.
 
-   Exemple :
-
-       {
-         "FOLDER_A": {
-           "Type": "Folder",
-           "SUB_A": {
-             "Type": "SubFolder",
-             "JOB_A": {
-               "Type": "Job:Command"
-             }
-           }
-         }
-       }
-
-   Le nom métier de l'objet est alors porté par la CLE JSON : FOLDER_A, SUB_A...
-
-2) FORMAT AVEC LISTE "Jobs"
-
-   Exemple :
-
-       {
-         "FOLDER_A": {
-           "Type": "Folder",
-           "Jobs": [
-             {
-               "Type": "Job:Command",
-               "Name": "JOB_A"
-             }
-           ]
-         }
-       }
-
-   Ici le nom n'est pas la clé JSON : il est lu dans le champ "Name".
-
-Le même mécanisme accepte également des SubFolders ou Jobs imbriqués dans des
-listes, tant que leur champ "Type" permet de reconnaître un objet Control-M.
-
-GESTION DES OCCURRENCES EN DOUBLE
----------------------------------
-Un même job peut apparaître plusieurs fois sous le même parent avec le même Name.
-Le script NE LES FUSIONNE PAS : chaque occurrence obtient sa propre ligne et un
-chemin technique unique suffixé par __OCC_n. Le nom Control-M affiché reste,
-lui, inchangé.
-
-DEROULEMENT GLOBAL
-------------------
-Le traitement suit volontairement des étapes simples :
-
-  ETAPE 1 - Lecture des arguments de la ligne de commande.
-  ETAPE 2 - Chargement du fichier JSON en mémoire avec json.load().
-  ETAPE 3 - Parcours récursif du JSON avec ControlMParser.
-            Le parseur construit une liste normalisée de tous les objets.
-  ETAPE 4 - Génération du fichier *_hierarchie.xlsx.
-  ETAPE 5 - Génération du fichier *_ligne.xlsx.
-  ETAPE 6 - Génération du fichier *_synthese.xlsx.
-  ETAPE 7 - Affichage du bilan dans la console.
-
-LES TROIS FICHIERS PRODUITS
----------------------------
-1) <nom>_hierarchie.xlsx
-
-   Vue détaillée organisée en plusieurs feuilles :
-
-   - Hierarchie : 1 ligne par Folder / SubFolder / Job dans l'ordre du JSON ;
-   - Variables  : 1 ligne par variable Control-M ;
-   - Events     : WaitFor / Add / Delete / Add conditionnel ;
-   - Planning   : détail des propriétés du bloc When ;
-   - Proprietes : autres propriétés de l'objet.
-
-2) <nom>_ligne.xlsx
-
-   Vue technique "à plat" :
-
-   - une seule feuille Tous_les_objets ;
-   - une seule ligne par Folder / SubFolder / Job ;
-   - les propriétés JSON sont transformées en colonnes ;
-   - les variables deviennent Variable.<NOM> ;
-   - les Events disposent de colonnes dédiées.
-
-3) <nom>_synthese.xlsx
-
-   Vue volontairement courte destinée à la lecture rapide :
-
-   - Niveau / Nom / Parent Folder / SubFolder ;
-   - Type ;
-   - Cyclique : détails du cycle si l'objet est cyclique
-     (Rerun, RerunIntervals, RerunSpecificTimes ou anciens champs compatibles) ;
-     la cellule reste vide si l'objet n'est pas cyclique ;
-   - Planification ;
-   - Calendrier ;
-   - Criticité : valeur STRICTEMENT issue de la variable Control-M SEVERITE ;
-   - Run As.
-
-DEPENDANCE
-----------
-Le script utilise uniquement la bibliothèque externe openpyxl pour écrire les
-fichiers XLSX :
-
-    python -m pip install openpyxl
-
-UTILISATION
------------
-Génération avec les noms de sortie automatiques :
-
-    python ctm_json_to_excel.py export.json
-
-Noms personnalisés :
-
-    python ctm_json_to_excel.py export.json \
-        --output export_hierarchie.xlsx \
-        --flat-output export_ligne.xlsx \
-        --summary-output export_synthese.xlsx
-
-IMPORTANT
----------
-Le script ne déduit pas la hiérarchie à partir du nom des jobs. La hiérarchie est
-celle réellement décrite par l'imbrication du JSON Control-M.
-===============================================================================
+La pipeline gère la sélection multi-JSON et appelle ce convertisseur une fois
+par export. merge_excel_exports concatène ensuite les classeurs, si demandé,
+avec une colonne Source JSON ; elle ne reconstruit pas de liens entre exports.
+Les bilans JSON/TXT décrivent les compteurs, avertissements, sorties et erreurs.
 """
 
 import argparse
 import json
+import math
+import ntpath
 import re
+import time
 from collections import Counter, defaultdict
+from copy import copy
+from datetime import datetime, timezone
 from pathlib import Path
 
 try:
-    from openpyxl import Workbook
-    from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+    from openpyxl import Workbook, load_workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.utils import get_column_letter
 except ImportError:
     raise SystemExit(
@@ -174,10 +59,11 @@ SKIP_RECURSIVE_KEYS = {
 # ---------------------------------------------------------------------------
 
 def is_controlm_object(node):
+    """Reconnaît les conteneurs et les types de jobs pris en charge."""
     if not isinstance(node, dict):
         return False
-    t = str(node.get("Type", ""))
-    return t in OBJECT_TYPES or t.startswith("Job")
+    obj_type = str(node.get("Type", ""))
+    return obj_type in OBJECT_TYPES or obj_type.startswith("Job")
 
 
 def flatten_value(value):
@@ -200,6 +86,7 @@ def flatten_value(value):
 
 
 def extract_variables(node):
+    """Accepte une liste de dictionnaires ou un dictionnaire de variables."""
     out = []
     vars_block = node.get("Variables")
     if isinstance(vars_block, list):
@@ -214,6 +101,7 @@ def extract_variables(node):
 
 
 def extract_events(block):
+    """Extrait les noms des Events du bloc, dans leur ordre d’origine."""
     events = []
     if isinstance(block, dict):
         items = block.get("Events", [])
@@ -225,7 +113,10 @@ def extract_events(block):
 
 
 def collect_conditional_event_adds(node, current_status=None, result=None):
-    """Recherche les Event:Add imbriqués dans les blocs If:CompletionStatus."""
+    """Recherche les Event:Add et leur statut dans les dictionnaires d’actions.
+
+    Les listes d’actions et les objets Control-M enfants ne sont pas parcourus.
+    """
     if result is None:
         result = []
     if not isinstance(node, dict):
@@ -275,13 +166,10 @@ def planning_summary(when):
 # ---------------------------------------------------------------------------
 # 3. PARSEUR CONTROL-M : TRANSFORMER LES DEUX FORMATS JSON EN UN MODELE UNIQUE
 # ---------------------------------------------------------------------------
-#
-# C'est la partie centrale du script. Une fois le JSON parcouru, self.objects
-# contient une succession d'objets tous décrits de la même façon, quel que soit
-# le format d'origine. Les générateurs Excel n'ont donc plus besoin de savoir si
-# un job venait d'une clé JSON ou d'une liste Jobs.
 
 class ControlMParser:
+    """Normalise les objets et conserve leur parent, ordre et occurrence."""
+
     def __init__(self):
         self.objects = []
         self._path_counts = defaultdict(int)
@@ -374,17 +262,14 @@ class ControlMParser:
 
     def walk_object(self, node, name, parent_path, depth, occurrence=1, occurrence_total=1):
         """Enregistre l'objet courant puis cherche uniquement ses enfants Control-M."""
-        # 1) L'objet courant rejoint le modèle normalisé.
+        # Le chemin enregistré devient le parent des enfants directs.
         current_path = self.add_object(
             node, name, parent_path, depth,
             occurrence=occurrence, occurrence_total=occurrence_total
         )
 
-        # 2) Les enfants directs auront cet objet comme parent et un niveau +1.
         child_depth = depth + 1
-        # 3) On parcourt les propriétés du nœud, mais on ne transforme PAS les
-        # blocs Variables/When/Events en objets hiérarchiques. Ils seront lus
-        # plus tard comme caractéristiques de l'objet.
+        # Variables/When/Events restent des propriétés, pas des objets enfants.
         for key, value in node.items():
             if key in SKIP_RECURSIVE_KEYS:
                 continue
@@ -465,6 +350,7 @@ def simple_extra_properties(node):
 
 
 def style_sheet(ws, freeze="A2", filter_row=1):
+    """Applique les en-têtes, filtres, volets et largeurs communes aux vues."""
     ws.freeze_panes = freeze
     ws.auto_filter.ref = ws.dimensions
 
@@ -493,13 +379,14 @@ def style_sheet(ws, freeze="A2", filter_row=1):
 
 
 def add_hierarchy_colors(ws, type_col=3):
+    """Colore les données par catégorie ou type exact, sans toucher à l’en-tête."""
     fills = {
         "Folder": PatternFill("solid", fgColor="D9EAF7"),
         "SubFolder": PatternFill("solid", fgColor="E2F0D9"),
         "Job": PatternFill("solid", fgColor="FFF2CC"),
     }
     for r in range(2, ws.max_row + 1):
-        category = ws.cell(r, type_col).value
+        category = obj_category(str(ws.cell(r, type_col).value or ""))
         fill = fills.get(category)
         if fill:
             for c in range(1, ws.max_column + 1):
@@ -511,6 +398,7 @@ def add_hierarchy_colors(ws, type_col=3):
 # ---------------------------------------------------------------------------
 
 def build_excel(parser, output_path, source_name):
+    """Crée la vue hiérarchique et ses quatre feuilles de détail."""
     wb = Workbook()
     ws = wb.active
     ws.title = "Hierarchie"
@@ -647,7 +535,6 @@ def build_excel(parser, output_path, source_name):
     ws.oddFooter.right.text = "Page &P / &N"
 
     wb.save(output_path)
-
 
 
 # ---------------------------------------------------------------------------
@@ -819,11 +706,42 @@ def build_flat_excel(parser, output_path, source_name):
 # 7. EXTRACTION DES INFORMATIONS PRINCIPALES POUR LA SYNTHESE
 # ---------------------------------------------------------------------------
 # Les exports peuvent légèrement varier selon les versions / types de job.
-# Ces fonctions centralisent donc les règles de lecture du planning, du
-# calendrier, de la criticité et des informations cycliques.
+# Ces fonctions centralisent les commandes/scripts, le planning, les calendriers,
+# la criticité, les cycles et les contrôles de définition.
+
+def extract_command_script(node):
+    """Affiche uniquement la définition pertinente pour le type du job.
+
+    Command : commande seule. Script : fichier seul. EmbeddedScript : contenu
+    et nom de fichier éventuel. Pour ces trois types, les champs non pertinents
+    sont ignorés. Pour les autres types : commande, sinon contenu, sinon fichier.
+    Aucun fichier externe n'est lu et aucune variable Control-M n'est résolue.
+    """
+    command = flatten_value(node.get("Command"))
+    value = node.get("Script")
+    script = "\n".join(flatten_value(x) for x in value) if isinstance(value, list) else flatten_value(value)
+    filename = flatten_value(node.get("FileName"))
+    directory = flatten_value(node.get("FilePath"))
+    if filename.strip() and directory and not ntpath.isabs(filename):
+        separator = "\\" if "\\" in directory else "/"
+        filename = directory.rstrip("/\\") + separator + filename
+
+    job_type = str(node.get("Type", ""))
+    if job_type == "Job:Command":
+        return command if command.strip() else ""
+    if job_type == "Job:Script":
+        return filename if filename.strip() else ""
+    if job_type == "Job:EmbeddedScript":
+        parts = [(label, text) for label, text in (("Script", script), ("Fichier", filename)) if text.strip()]
+        if len(parts) == 1:
+            return parts[0][1]
+        return "\n\n".join(f"{label}: {text}" for label, text in parts)
+    # Compatibilité pour les autres types : une seule information, par priorité.
+    return next((text for text in (command, script, filename) if text.strip()), "")
+
 
 def get_when_block(node):
-    """Retourne le bloc de planification quelle que soit sa clé d'export."""
+    """Lit le premier bloc dictionnaire parmi When, Scheduling et Schedule."""
     for key in ("When", "Scheduling", "Schedule"):
         value = node.get(key)
         if isinstance(value, dict):
@@ -1114,9 +1032,51 @@ def extract_cyclic(node):
     return ""
 
 
+def definition_warning(node):
+    """Contrôle ciblé, non bloquant, des trois types de jobs OS connus."""
+    fields = {
+        "Job:Command": ("Command", "Commande absente ou vide"),
+        "Job:Script": ("FileName", "Nom de fichier de script absent ou vide"),
+        "Job:EmbeddedScript": ("Script", "Contenu du script embarqué absent ou vide"),
+    }
+    field, message = fields.get(str(node.get("Type", "")), (None, ""))
+    if field is None:
+        return ""
+    value = node.get(field)
+    if isinstance(value, list):
+        present = any(flatten_value(item).strip() for item in value)
+    else:
+        present = bool(flatten_value(value).strip())
+    return "" if present else message
+
+
 # ---------------------------------------------------------------------------
 # 8. EXCEL N°3 : VUE SYNTHETIQUE
 # ---------------------------------------------------------------------------
+
+def format_summary_details(ws):
+    """Hauteurs estimées selon les largeurs, plafonnées à 300 points (20 lignes).
+
+    Cette mise en forme ne raccourcit pas la valeur. Au-delà de la hauteur
+    visible, utiliser la barre de formule. La limite Excel reste 32 767 caractères.
+    """
+    headers = {cell.value: cell.column for cell in ws[1]}
+    command_column = headers["Commande / Script"]
+    warning_column = headers["Contrôle définition"]
+    for row in ws.iter_rows(min_row=2):
+        row[command_column - 1].font = Font(name="Consolas", size=10)
+        lines = 1
+        for cell in row:
+            width = max(1, ws.column_dimensions[cell.column_letter].width - 3)
+            text = str(cell.value or "").expandtabs(4)
+            wrapped = sum(max(1, math.ceil(len(line) / width)) for line in text.split("\n"))
+            lines = max(lines, wrapped)
+        ws.row_dimensions[row[0].row].height = min(300, max(18, lines * 15 + 3))
+        warning = row[warning_column - 1]
+        if warning.value:
+            warning.fill = PatternFill("solid", fgColor="FCE4D6")
+            warning.font = Font(color="9C0006", bold=True)
+
 
 def build_summary_excel(parser, output_path, source_name):
     """Crée le troisième Excel synthétique : une ligne par objet, colonnes principales."""
@@ -1127,7 +1087,8 @@ def build_summary_excel(parser, output_path, source_name):
     objects_by_path = {o["path"]: o for o in parser.objects}
     headers = [
         "Niveau", "Nom", "Parent Folder", "SubFolder",
-        "Type", "Cyclique", "Planification", "Calendrier", "Criticité", "Run As",
+        "Type", "Commande / Script", "Cyclique", "Planification",
+        "Calendrier", "Criticité", "Host", "Run As", "Contrôle définition",
     ]
     ws.append(headers)
 
@@ -1153,48 +1114,36 @@ def build_summary_excel(parser, output_path, source_name):
             parent_folder,
             subfolder,
             obj["type"],
+            extract_command_script(node),
             extract_cyclic(node),
             extract_planification_main(node),
             extract_calendar(node),
             extract_criticality(node),
+            flatten_value(node.get("Host")),
             flatten_value(run_as),
+            definition_warning(node),
         ])
+        # Une commande commençant par '=' reste du texte, jamais une formule.
+        ws.cell(ws.max_row, 6).data_type = "s"
 
     style_sheet(ws)
 
-    # Coloration par nature d'objet. Ici le type exact est en colonne E.
-    fills = {
-        "Folder": PatternFill("solid", fgColor="D9EAF7"),
-        "SubFolder": PatternFill("solid", fgColor="E2F0D9"),
-        "Job": PatternFill("solid", fgColor="FFF2CC"),
-    }
-    for row in range(2, ws.max_row + 1):
-        exact_type = str(ws.cell(row, 5).value or "")
-        cat = obj_category(exact_type)
-        fill = fills.get(cat)
-        if fill:
-            for col in range(1, ws.max_column + 1):
-                ws.cell(row, col).fill = fill
-
-    # On réapplique explicitement le style de l'en-tête APRES la coloration des
-    # lignes. Cela garantit que toutes les colonnes, y compris "Cyclique", ont
-    # exactement le même fond bleu, la même police blanche et le même alignement.
-    summary_header_fill = PatternFill("solid", fgColor="1F4E78")
-    summary_header_font = Font(color="FFFFFF", bold=True)
-    for cell in ws[1]:
-        cell.fill = summary_header_fill
-        cell.font = summary_header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    # Type Control-M exact en E ; la coloration commence à la ligne 2.
+    add_hierarchy_colors(ws, type_col=5)
 
     ws.column_dimensions["B"].width = 52
     ws.column_dimensions["C"].width = 36
     ws.column_dimensions["D"].width = 36
     ws.column_dimensions["E"].width = 28
-    ws.column_dimensions["F"].width = 55
-    ws.column_dimensions["G"].width = 45
+    ws.column_dimensions["F"].width = 80
+    ws.column_dimensions["G"].width = 55
     ws.column_dimensions["H"].width = 45
-    ws.column_dimensions["I"].width = 16
-    ws.column_dimensions["J"].width = 28
+    ws.column_dimensions["I"].width = 45
+    ws.column_dimensions["J"].width = 16
+    ws.column_dimensions["K"].width = 32
+    ws.column_dimensions["L"].width = 28
+    ws.column_dimensions["M"].width = 48
+    format_summary_details(ws)
 
     ws.sheet_properties.pageSetUpPr.fitToPage = True
     ws.oddHeader.center.text = f"Control-M - synthèse - {source_name}"
@@ -1202,12 +1151,118 @@ def build_summary_excel(parser, output_path, source_name):
     wb.save(output_path)
 
 # ---------------------------------------------------------------------------
-# 9. INTERFACE LIGNE DE COMMANDE
+# 9. CONSOLIDATION OPTIONNELLE DES CLASSEURS
+# ---------------------------------------------------------------------------
+
+def merge_excel_exports(exports, output_directory):
+    """Concatène les XLSX déjà générés, sans relire ni fusionner les JSON.
+
+    exports : couples ordonnés (nom JSON complet, dossier des XLSX).
+    Colonnes alignées par intitulé ; toutes les lignes sont conservées.
+    La pipeline appelle cette fonction après les conversions unitaires.
+    """
+    exports = list(exports)
+    if not exports:
+        raise ValueError("Aucun export à consolider.")
+    output_directory = Path(output_directory)
+    families = {
+        "hierarchie": ["Hierarchie", "Variables", "Events", "Planning", "Proprietes"],
+        "ligne": ["Tous_les_objets"],
+        "synthese": ["Synthese"],
+    }
+    for source, directory in exports:
+        for family in families:
+            path = Path(directory) / f"{Path(source).stem}_{family}.xlsx"
+            if not path.is_file():
+                raise FileNotFoundError(f"Classeur manquant : {path}")
+    output_directory.mkdir(parents=True, exist_ok=True)
+    results = []
+    for family, sheet_names in families.items():
+        merged = Workbook()
+        merged.remove(merged.active)
+        headers = {name: ["Source JSON"] for name in sheet_names}
+        widths = {name: {} for name in sheet_names}
+        # Union ordonnée des en-têtes, notamment des propriétés/variables à plat.
+        for source, directory in exports:
+            path = Path(directory) / f"{Path(source).stem}_{family}.xlsx"
+            workbook = load_workbook(path)
+            try:
+                if workbook.sheetnames != sheet_names:
+                    raise ValueError(f"Feuilles inattendues : {path}")
+                for name in sheet_names:
+                    ws = workbook[name]
+                    source_headers = [cell.value for cell in ws[1]]
+                    if (any(not isinstance(h, str) or not h for h in source_headers)
+                            or len(set(source_headers)) != len(source_headers)
+                            or "Source JSON" in source_headers):
+                        raise ValueError(f"En-têtes invalides ou réservés : {path} / {name}")
+                    for column, header in enumerate(source_headers, 1):
+                        if header not in headers[name]:
+                            headers[name].append(header)
+                        width = ws.column_dimensions[get_column_letter(column)].width or 13
+                        widths[name][header] = max(widths[name].get(header, 0), width)
+            finally:
+                workbook.close()
+        for name in sheet_names:
+            if len(headers[name]) > 16384:
+                raise ValueError(f"Limite Excel de colonnes dépassée : {name}")
+            merged.create_sheet(name).append(headers[name])
+        # Concaténation dans l'ordre saisi, sans dédoublonner les objets.
+        for source, directory in exports:
+            path = Path(directory) / f"{Path(source).stem}_{family}.xlsx"
+            workbook = load_workbook(path)
+            try:
+                for name in sheet_names:
+                    src, dst = workbook[name], merged[name]
+                    if dst.max_row + src.max_row - 1 > 1048576:
+                        raise ValueError(f"Limite Excel de lignes dépassée : {name}")
+                    columns = {header: i for i, header in enumerate(headers[name], 1)}
+                    positions = [columns[cell.value] for cell in src[1]]
+                    for row in src.iter_rows(min_row=2):
+                        target_row = dst.max_row + 1
+                        provenance = dst.cell(target_row, 1, source)
+                        provenance.data_type = "s"
+                        provenance.fill = copy(row[0].fill)
+                        for cell, column in zip(row, positions):
+                            target = dst.cell(target_row, column, cell.value)
+                            target.data_type = cell.data_type
+                            target.font = copy(cell.font)
+                            target.fill = copy(cell.fill)
+                            target.border = copy(cell.border)
+                            target.number_format = cell.number_format
+                            target.alignment = copy(cell.alignment)
+                        dst.row_dimensions[target_row].height = src.row_dimensions[row[0].row].height
+            finally:
+                workbook.close()
+        for name in sheet_names:
+            ws = merged[name]
+            style_sheet(ws, freeze="B2")
+            ws.column_dimensions["A"].width = 36
+            for column, header in enumerate(headers[name][1:], 2):
+                ws.column_dimensions[get_column_letter(column)].width = widths[name][header]
+            if name == "Synthese" and "Contrôle définition" in headers[name]:
+                format_summary_details(ws)
+            ws.sheet_properties.pageSetUpPr.fitToPage = True
+            ws.oddHeader.center.text = "Control-M - consolidation"
+            ws.oddFooter.right.text = "Page &P / &N"
+        destination = output_directory / f"consolide_{family}.xlsx"
+        merged.save(destination)
+        merged.close()
+        results.append(destination)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# 10. INTERFACE LIGNE DE COMMANDE ET BILANS
 # ---------------------------------------------------------------------------
 
 def parse_args():
+    """Lit les options de conversion d’un seul JSON."""
     p = argparse.ArgumentParser(
-        description="Convertit un export JSON Control-M en trois fichiers Excel : hiérarchique, à plat et synthétique."
+        description=(
+            "Convertit un export JSON Control-M en trois fichiers Excel : "
+            "hiérarchique, à plat et synthétique."
+        )
     )
     p.add_argument("input_json", help="Fichier JSON Control-M")
     p.add_argument(
@@ -1222,23 +1277,51 @@ def parse_args():
         "--summary-output",
         help="Nom du fichier Excel synthétique (défaut : <json>_synthese.xlsx)"
     )
+    p.add_argument(
+        "--report-output",
+        help=(
+            "Bilan JSON (défaut : à côté de la synthèse, "
+            "<json>_generation-info.json). Un bilan .txt est aussi écrit."
+        ),
+    )
     return p.parse_args()
 
 
+def write_generation_report(report, path):
+    """Écrit les bilans JSON/TXT dans un dossier existant et accessible.
+
+    Le bilan peut décrire un échec de conversion ; une erreur d’écriture reste
+    bloquante et empêche de garantir sa disponibilité.
+    """
+    path = Path(path)
+    path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    lines = [
+        "Bilan de génération Control-M", f"Source : {report['source_json']}",
+        f"Statut : {report['status']}", f"Début (UTC) : {report['started_at']}",
+        f"Fin (UTC) : {report['finished_at']}", f"Durée : {report['duration_seconds']} s",
+        "Objets : " + ", ".join(f"{key}={value}" for key, value in report['counts'].items()),
+        f"Définitions incomplètes : {len(report['warnings'])}",
+    ]
+    lines.extend(f"AVERTISSEMENT : {w['path']} ({w['type']}) : {w['message']}" for w in report['warnings'])
+    lines.extend(f"Fichier généré : {file}" for file in report['outputs'])
+    if report.get("error"):
+        lines.append("ERREUR : " + report['error'])
+    path.with_suffix(".txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
-# 10. POINT D'ENTREE DU PROGRAMME
+# 11. CONVERSION UNITAIRE ET POINT D’ENTRÉE
 # ---------------------------------------------------------------------------
 
 def main():
-    # ETAPE 1 : récupérer les options fournies par l'utilisateur / le pipeline.
+    """Convertit un JSON et produit son bilan, puis propage tout échec."""
     args = parse_args()
     input_path = Path(args.input_json)
-    if not input_path.exists():
-        raise SystemExit(f"Fichier introuvable : {input_path}")
-
-    # ETAPE 2 : calculer les trois chemins de sortie. Si aucun nom n'est fourni,
-    # ils sont créés à côté du JSON source avec des suffixes explicites.
-    output_path = Path(args.output) if args.output else input_path.with_name(input_path.stem + "_hierarchie.xlsx")
+    output_path = (
+        Path(args.output)
+        if args.output
+        else input_path.with_name(input_path.stem + "_hierarchie.xlsx")
+    )
     flat_output_path = (
         Path(args.flat_output)
         if args.flat_output
@@ -1249,31 +1332,63 @@ def main():
         if args.summary_output
         else input_path.with_name(input_path.stem + "_synthese.xlsx")
     )
-
-    # ETAPE 3 : charger le JSON. utf-8-sig accepte aussi un éventuel BOM.
-    with input_path.open("r", encoding="utf-8-sig") as fh:
-        data = json.load(fh)
-
-    # ETAPE 4 : construire le modèle mémoire unique Folder/SubFolder/Job.
-    parser = ControlMParser()
-    parser.walk(data)
-
-    if not parser.objects:
-        raise SystemExit("Aucun Folder/SubFolder/Job Control-M détecté dans le JSON.")
-
-    # ETAPE 5 : produire les trois représentations Excel à partir du même modèle.
-    build_excel(parser, output_path, input_path.name)
-    build_flat_excel(parser, flat_output_path, input_path.name)
-    build_summary_excel(parser, summary_output_path, input_path.name)
-
-    # ETAPE 6 : afficher un bilan lisible dans la console / les logs Azure DevOps.
-    folders = sum(1 for o in parser.objects if o["type"] == "Folder")
-    subfolders = sum(1 for o in parser.objects if o["type"] == "SubFolder")
-    jobs = sum(1 for o in parser.objects if o["type"].startswith("Job"))
-    print(f"OK : {len(parser.objects)} objets exportés ({folders} Folder, {subfolders} SubFolder, {jobs} Jobs)")
-    print(f"Fichier hiérarchique : {output_path}")
-    print(f"Fichier une ligne/objet : {flat_output_path}")
-    print(f"Fichier synthétique : {summary_output_path}")
+    report_path = (
+        Path(args.report_output)
+        if args.report_output
+        else summary_output_path.parent / (input_path.stem + "_generation-info.json")
+    )
+    if report_path.suffix.lower() != ".json":
+        raise SystemExit("--report-output doit désigner un fichier .json.")
+    # Ne jamais écraser une entrée ou un classeur avec le bilan.
+    protected = {p.resolve() for p in (input_path, output_path, flat_output_path, summary_output_path)}
+    if report_path.resolve() in protected or report_path.with_suffix(".txt").resolve() in protected:
+        raise SystemExit("Le chemin du bilan doit être distinct des entrées et des classeurs.")
+    started = time.perf_counter()
+    report = {
+        "source_json": input_path.name,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "status": "ECHEC", "counts": {"Folder": 0, "SubFolder": 0, "Job": 0, "Total": 0},
+        "warnings": [], "outputs": [],
+    }
+    error = None
+    try:
+        with input_path.open("r", encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+        parser = ControlMParser()
+        parser.walk(data)
+        if not parser.objects:
+            raise ValueError("Aucun Folder/SubFolder/Job Control-M détecté dans le JSON.")
+        for obj in parser.objects:
+            report["counts"][obj_category(obj["type"])] += 1
+            warning = definition_warning(obj["node"])
+            if warning:
+                report["warnings"].append({"path": obj["path"], "type": obj["type"], "message": warning})
+                print(f"AVERTISSEMENT : {obj['path']} : {warning}", flush=True)
+        report["counts"]["Total"] = len(parser.objects)
+        for builder, path in (
+            (build_excel, output_path),
+            (build_flat_excel, flat_output_path),
+            (build_summary_excel, summary_output_path),
+        ):
+            builder(parser, path, input_path.name)
+            report["outputs"].append(str(path))
+            print(f"Fichier généré : {path}")
+        report["status"] = "OK_AVEC_AVERTISSEMENTS" if report["warnings"] else "OK"
+    except Exception as exc:
+        # Conserver l’erreur dans le bilan avant de terminer avec un code non nul.
+        error = exc
+        report["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        report["finished_at"] = datetime.now(timezone.utc).isoformat()
+        report["duration_seconds"] = round(time.perf_counter() - started, 3)
+        write_generation_report(report, report_path)
+    print(f"Bilan : {report_path.with_suffix('.txt')}")
+    if error is not None:
+        raise SystemExit(report["error"])
+    print(
+        f"{report['status']} : {report['counts']['Total']} objets exportés, "
+        f"{len(report['warnings'])} avertissement(s)."
+    )
 
 
 if __name__ == "__main__":

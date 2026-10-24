@@ -1,67 +1,18 @@
-# =============================================================================
-# Pipeline : Export JSON Control-M -> 3 fichiers Excel
-# =============================================================================
+# Pipeline manuelle Control-M JSON -> Excel.
 #
-# OBJECTIF
-# --------
-# Cette pipeline permet de choisir la provenance du JSON Control-M puis lance
-# le script Python ctm_json_to_excel.py.
+# Une source commune, un nom/masque ou une liste séparée par des virgules.
+# Les noms et l’existence des fichiers sont validés avant le nettoyage unique.
+# Le contenu de chaque JSON est analysé lors de sa conversion.
+# Un appel Python par JSON, dans l’ordre retenu, avec arrêt au premier échec.
 #
-# Pour chaque JSON sélectionné, le script produit :
-#   - <nom>_hierarchie.xlsx
-#   - <nom>_ligne.xlsx
-#   - <nom>_synthese.xlsx
+# Sorties par export : hiérarchie, vue à plat, synthèse et bilans JSON/TXT.
+# mergeExcel ajoute trois classeurs consolidés après succès de tous les appels.
+# generation-info.txt récapitule le run ; l’artifact n’est publié qu’en cas de succès.
 #
-# La pipeline est volontairement MANUELLE afin que l'utilisateur choisisse la
-# source et le fichier au moment de faire "Run pipeline" dans Azure DevOps.
-#
-# -----------------------------------------------------------------------------
-# SOURCE JSON CONTROL-M
-# -----------------------------------------------------------------------------
-# BUILD
-#   DEV BUILD   -> build/dev
-#   PPRD BUILD  -> build/pep
-#   QAL BUILD   -> build/qaf
-#   PROD BUILD  -> build/prd
-#
-# Les JSON BUILD sont principalement destinés aux besoins liés aux tickets
-# Jira CLM. Il s'agit généralement d'exports correspondant au périmètre d'une
-# évolution, souvent nommés CLM-XXX.json.
-#
-# SMARTFOLDER
-#   DEV SMARTFOLDER   -> src/smartfolder/dev
-#   PPRD SMARTFOLDER  -> src/smartfolder/pep
-#   QAL SMARTFOLDER   -> src/smartfolder/qaf
-#   PROD SMARTFOLDER  -> src/smartfolder/prd
-#
-# Les JSON SMARTFOLDER correspondent aux SmartFolders extraits automatiquement
-# depuis Control-M et régulièrement remis à jour.
-#
-# -----------------------------------------------------------------------------
-# PARAMETRE "Fichier(s) JSON à analyser"
-# -----------------------------------------------------------------------------
-# Le paramètre jsonFile accepte :
-#   - un nom exact : CLM-200-PRD.json
-#   - un masque     : CLM-*.json
-#   - tous les JSON : *.json
-#
-# La recherche est volontairement limitée au répertoire choisi par le paramètre
-# "Source JSON Control-M".
-#
-# -----------------------------------------------------------------------------
-# EMPLACEMENT DU SCRIPT PYTHON
-# -----------------------------------------------------------------------------
-# Par défaut, la variable pythonScript suppose que le script est situé à la
-# racine du repository :
-#
-#   ctm_json_to_excel.py
-#
-# S'il est rangé ailleurs, par exemple scripts/controlm/, modifier simplement :
-#
-#   pythonScript: 'scripts/controlm/ctm_json_to_excel.py'
-# =============================================================================
+# GitHub : main pour les sources. Azure DevOps : integration pour l’exécution.
+# Script attendu : cipipeline/ctm_to_excel/ctm_json_to_excel.py.
+# Le détail des formats, des contrôles et des huit sources figure dans README.md.
 
-# Exécution manuelle uniquement : les paramètres seront choisis dans l'interface.
 trigger: none
 pr: none
 
@@ -84,18 +35,21 @@ parameters:
   - 'PROD SMARTFOLDER'
 
 - name: jsonFile
-  displayName: 'Fichier(s) JSON à analyser'
+  displayName: 'JSON à analyser (noms ou masques séparés par des virgules)'
   type: string
   # Valeur pratique par défaut : traite tous les JSON du répertoire choisi.
   # Pour une CLM précise, saisir par exemple : CLM-200-PRD.json
   default: '*.json'
 
+- name: mergeExcel
+  displayName: 'Consolider les Excel de tous les JSON'
+  type: boolean
+  default: false
+
 # -----------------------------------------------------------------------------
 # Agent
 # -----------------------------------------------------------------------------
-# Le script est multiplateforme. ubuntu-latest est utilisé ici car Python y est
-# simple à préparer. Si votre organisation impose un pool self-hosted, remplacer
-# ce bloc par votre pool habituel.
+# La pipeline utilise Bash ; un pool de remplacement doit fournir cet environnement.
 pool:
   vmImage: 'ubuntu-latest'
 
@@ -106,7 +60,7 @@ variables:
   # Chemin relatif au repository du script Python.
   pythonScript: 'cipipeline/ctm_to_excel/ctm_json_to_excel.py'
 
-  # Tous les Excel seront écrits ici avant publication en artefact Azure DevOps.
+  # Dossier dédié aux classeurs et bilans, nettoyé une seule fois par run.
   excelOutputDirectory: '$(Build.ArtifactStagingDirectory)/controlm-excel'
 
   # ---------------------------------------------------------------------------
@@ -173,8 +127,7 @@ steps:
 # =============================================================================
 # ETAPE 2 - Préparer Python
 # =============================================================================
-# On fixe une version de Python afin d'éviter qu'une évolution de l'agent change
-# le comportement de la pipeline.
+# La même version mineure de Python est utilisée pour toutes les conversions.
 - task: UsePythonVersion@0
   displayName: 'Préparer Python 3.11'
   inputs:
@@ -193,94 +146,171 @@ steps:
   displayName: 'Installer openpyxl'
 
 # =============================================================================
-# ETAPE 4 - Afficher la sélection et contrôler les chemins
+# ETAPE 4 - Validation, conversions, consolidation et bilan global
 # =============================================================================
+# Les paramètres transitent par env, jamais par interpolation dans du code shell.
+# subprocess.run(check=True) arrête le run dès le premier échec Python.
 - bash: |
     set -euo pipefail
+    python - <<'PYTHON'
+    import fnmatch
+    import importlib.util
+    import json
+    import os
+    import shutil
+    import subprocess
+    import sys
+    import time
+    from datetime import datetime, timezone
+    from pathlib import Path
 
-    SOURCE_DIR="$(Build.SourcesDirectory)/$(sourceDirectory)"
-    SCRIPT="$(Build.SourcesDirectory)/$(pythonScript)"
-    JSON_PATTERN='${{ parameters.jsonFile }}'
+    source = Path(os.environ["SOURCE_DIR"]).resolve()
+    script = Path(os.environ["SCRIPT_PATH"]).resolve()
+    output_raw = Path(os.environ["OUTPUT_DIR"])
+    output = output_raw.resolve()
+    staging = Path(os.environ["STAGING_DIR"]).resolve()
+    selection = os.environ["JSON_SELECTION"]
+    merge = os.environ["MERGE_EXCEL"].lower() == "true"
 
-    echo "============================================================"
-    echo "Source JSON Control-M : ${{ parameters.sourceJsonControlM }}"
-    echo "Répertoire source     : $SOURCE_DIR"
-    echo "Sélection JSON        : $JSON_PATTERN"
-    echo "Script Python         : $SCRIPT"
-    echo "============================================================"
+    if not source.is_dir():
+        raise SystemExit(f"Répertoire source introuvable : {source}")
+    if not script.is_file():
+        raise SystemExit(f"Script Python introuvable : {script}")
+    # Le nettoyage reste strictement dans le dossier d'artefacts dédié.
+    if (output_raw.is_symlink() or output == staging or staging not in output.parents
+            or output == source or output in source.parents or output in script.parents):
+        raise SystemExit(f"Dossier de sortie non autorisé : {output}")
 
-    if [ ! -d "$SOURCE_DIR" ]; then
-      echo "##vso[task.logissue type=error]Répertoire source introuvable : $SOURCE_DIR"
-      exit 1
-    fi
+    selected = []
+    seen = set()
+    errors = []
+    entries = selection.split(",")
+    for position, raw in enumerate(entries, 1):
+        name = raw.strip()
+        if (not name or ".." in name or any(c in name for c in "/\\:")
+                or any(ord(c) < 32 or ord(c) == 127 for c in name)
+                or not name.lower().endswith(".json")):
+            errors.append(f"Entrée {position} invalide : {name!r} (nom ou masque .json uniquement)")
+            continue
+        # Nom exact prioritaire ; sinon masque compatible avec les anciens usages.
+        exact = source / name
+        if exact.exists() or exact.is_symlink():
+            matches = [exact]
+        elif any(c in name for c in "*?["):
+            matches = sorted((p for p in source.iterdir()
+                              if fnmatch.fnmatchcase(p.name, name)), key=lambda p: p.name)
+        else:
+            matches = []
+        if not matches:
+            errors.append(f"Aucun fichier trouvé pour : {name}")
+        for path in matches:
+            if (path.is_symlink() or not path.is_file()
+                    or path.resolve().parent != source
+                    or not path.name.lower().endswith(".json")):
+                errors.append(f"Fichier non autorisé : {path.name}")
+                continue
+            if path.name not in seen:
+                seen.add(path.name)
+                selected.append(path)
+    if errors:
+        raise SystemExit("Validation des JSON échouée :\n- " + "\n- ".join(errors))
+    if not selected:
+        raise SystemExit("Aucun JSON sélectionné.")
 
-    if [ ! -f "$SCRIPT" ]; then
-      echo "##vso[task.logissue type=error]Script Python introuvable : $SCRIPT"
-      echo "Vérifier la variable 'pythonScript' dans le YAML."
-      exit 1
-    fi
-
-    # Le paramètre doit rester un nom ou un masque de fichier et ne doit pas
-    # permettre de sortir du répertoire source sélectionné.
-    if [[ "$JSON_PATTERN" == *".."* || "$JSON_PATTERN" == /* ]]; then
-      echo "##vso[task.logissue type=error]Le paramètre jsonFile ne doit pas contenir '..' ni être un chemin absolu."
-      exit 1
-    fi
-  displayName: 'Contrôler les paramètres'
+    print(f"Source : {os.environ['SOURCE_LABEL']}", flush=True)
+    print(f"{len(selected)} JSON validé(s) : " + ", ".join(p.name for p in selected), flush=True)
+    # Tous les noms et fichiers sont validés AVANT nettoyage et conversion.
+    # Un seul nettoyage pour le run, jamais dans la boucle.
+    if output.exists():
+        shutil.rmtree(output)
+    output.mkdir(parents=True)
+    exports = []
+    reports = []
+    consolidated = []
+    started_at = datetime.now(timezone.utc).isoformat()
+    started = time.perf_counter()
+    run_error = None
+    current_name = None
+    try:
+        for index, path in enumerate(selected, 1):
+            current_name = path.name
+            destination = output / path.name  # extension .json incluse
+            destination.mkdir()
+            report_path = destination / f"{path.stem}_generation-info.json"
+            print(f"JSON {index}/{len(selected)} : {path.name}", flush=True)
+            try:
+                subprocess.run([
+                    sys.executable, str(script), str(path),
+                    "--output", str(destination / f"{path.stem}_hierarchie.xlsx"),
+                    "--flat-output", str(destination / f"{path.stem}_ligne.xlsx"),
+                    "--summary-output", str(destination / f"{path.stem}_synthese.xlsx"),
+                    "--report-output", str(report_path),
+                ], check=True)
+            finally:
+                # Le convertisseur peut laisser un bilan utile même en cas d’échec.
+                if report_path.is_file():
+                    reports.append(json.loads(report_path.read_text(encoding="utf-8")))
+            exports.append((path.name, destination))
+        current_name = None
+        # Ne consolider que les sorties de CE run, après succès de tous les appels.
+        if merge:
+            spec = importlib.util.spec_from_file_location("ctm_excel", script)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            for path in module.merge_excel_exports(exports, output / "CONSOLIDE"):
+                consolidated.append(str(path.relative_to(output)))
+                print(f"Consolidation : {path.relative_to(output)}", flush=True)
+    except Exception as exc:
+        run_error = str(exc)
+        raise
+    finally:
+        # Bilan écrit même si un appel ou la consolidation échoue ; aucun appel suivant.
+        warning_count = sum(len(r["warnings"]) for r in reports)
+        status = "ECHEC" if run_error else ("OK_AVEC_AVERTISSEMENTS" if warning_count else "OK")
+        totals = {key: sum(r["counts"][key] for r in reports) for key in ("Folder", "SubFolder", "Job", "Total")}
+        lines = [
+            "Bilan de génération Control-M", f"Statut : {status}",
+            f"Source : {os.environ['SOURCE_LABEL']}", f"Sélection : {selection}",
+            f"Début (UTC) : {started_at}", f"Fin (UTC) : {datetime.now(timezone.utc).isoformat()}",
+            f"Durée : {time.perf_counter() - started:.3f} s",
+            f"JSON sélectionnés : {len(selected)} ; conversions réussies : {len(exports)}",
+            "Objets analysés : " + ", ".join(f"{k}={v}" for k, v in totals.items()),
+            f"Définitions incomplètes : {warning_count}", f"Consolidation demandée : {merge}",
+        ]
+        by_name = {r["source_json"]: r for r in reports}
+        completed = {name for name, _ in exports}
+        for path in selected:
+            report = by_name.get(path.name)
+            state = report["status"] if report else ("ECHEC" if path.name == current_name else "NON_TRAITE")
+            if path.name == current_name and run_error and path.name not in completed:
+                state = "ECHEC"
+            lines.append(f"JSON : {path.name} : {state}")
+            if report:
+                lines.append("  Objets : " + ", ".join(f"{k}={v}" for k, v in report["counts"].items()))
+                lines.extend(f"  AVERTISSEMENT : {w['path']} ({w['type']}) : {w['message']}" for w in report["warnings"])
+                lines.extend(f"  Fichier : {Path(f).relative_to(output)}" for f in report["outputs"])
+                if report.get("error"):
+                    lines.append("  ERREUR : " + report["error"])
+        lines.extend(f"Classeur consolidé : {f}" for f in consolidated)
+        if run_error:
+            lines.append("ERREUR DU RUN : " + run_error)
+        text = "\n".join(lines) + "\n"
+        (output / "generation-info.txt").write_text(text, encoding="utf-8")
+        print(text, flush=True)
+    print("Génération terminée.", flush=True)
+    PYTHON
+  displayName: 'Valider et traiter les JSON puis consolider si demandé'
+  env:
+    SOURCE_DIR: '$(Build.SourcesDirectory)/$(sourceDirectory)'
+    SOURCE_LABEL: ${{ parameters.sourceJsonControlM }}
+    SCRIPT_PATH: '$(Build.SourcesDirectory)/$(pythonScript)'
+    OUTPUT_DIR: '$(excelOutputDirectory)'
+    STAGING_DIR: '$(Build.ArtifactStagingDirectory)'
+    JSON_SELECTION: ${{ parameters.jsonFile }}
+    MERGE_EXCEL: '${{ parameters.mergeExcel }}'
 
 # =============================================================================
-# ETAPE 5 - Générer les trois Excel pour chaque JSON correspondant
-# =============================================================================
-- bash: |
-    set -euo pipefail
-
-    SOURCE_DIR="$(Build.SourcesDirectory)/$(sourceDirectory)"
-    SCRIPT="$(Build.SourcesDirectory)/$(pythonScript)"
-    OUTPUT_DIR="$(excelOutputDirectory)"
-    JSON_PATTERN='${{ parameters.jsonFile }}'
-
-    mkdir -p "$OUTPUT_DIR"
-
-    # On collecte les fichiers avec find afin que le masque *.json ou CLM-*.json
-    # soit interprété dans le seul répertoire source sélectionné.
-    JSON_FILES=()
-    while IFS= read -r -d '' JSON_FILE; do
-      JSON_FILES+=("$JSON_FILE")
-    done < <(find "$SOURCE_DIR" -maxdepth 1 -type f -name "$JSON_PATTERN" -print0 | sort -z)
-
-    if [ "${#JSON_FILES[@]}" -eq 0 ]; then
-      echo "##vso[task.logissue type=error]Aucun JSON correspondant à '$JSON_PATTERN' dans '$SOURCE_DIR'."
-      echo "JSON disponibles dans ce répertoire :"
-      find "$SOURCE_DIR" -maxdepth 1 -type f -name '*.json' -printf '  - %f\n' | sort || true
-      exit 1
-    fi
-
-    echo "${#JSON_FILES[@]} fichier(s) JSON à traiter."
-
-    for JSON_FILE in "${JSON_FILES[@]}"; do
-      FILE_NAME="$(basename "$JSON_FILE")"
-      STEM="${FILE_NAME%.json}"
-
-      echo
-      echo "------------------------------------------------------------"
-      echo "Traitement : $FILE_NAME"
-      echo "------------------------------------------------------------"
-
-      python "$SCRIPT" "$JSON_FILE" \
-        --output "$OUTPUT_DIR/${STEM}_hierarchie.xlsx" \
-        --flat-output "$OUTPUT_DIR/${STEM}_ligne.xlsx" \
-        --summary-output "$OUTPUT_DIR/${STEM}_synthese.xlsx"
-    done
-
-    echo
-    echo "============================================================"
-    echo "Fichiers Excel générés :"
-    find "$OUTPUT_DIR" -maxdepth 1 -type f -name '*.xlsx' -printf '  - %f\n' | sort
-    echo "============================================================"
-  displayName: 'Générer les Excel Control-M'
-
-# =============================================================================
-# ETAPE 6 - Publier les fichiers comme artefact Azure DevOps
+# ETAPE 5 - Publier les classeurs et bilans en cas de succès
 # =============================================================================
 # PublishBuildArtifacts@1 fonctionne avec Azure Pipelines / Azure DevOps Server.
 # Dans Azure DevOps Services, PublishPipelineArtifact@1 peut aussi être utilisé.
